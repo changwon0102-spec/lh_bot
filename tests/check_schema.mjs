@@ -1,0 +1,42 @@
+// Optional SQL integration test: npm install --prefix .scratch/sql-check --ignore-scripts --save-exact @electric-sql/pglite@0.5.8
+// Run: node tests/check_schema.mjs. Uses memory only; no remote Supabase changes.
+import { PGlite } from '../.scratch/sql-check/node_modules/@electric-sql/pglite/dist/index.js';
+import { readFile } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+
+const db = new PGlite();
+await db.exec('create role anon; create role authenticated; create role service_role bypassrls;');
+await db.exec(await readFile(new URL('../schema.sql', import.meta.url), 'utf8'));
+await db.exec('set role service_role');
+const token1 = '00000000-0000-4000-8000-000000000001';
+const token2 = '00000000-0000-4000-8000-000000000002';
+const payload = { title: '서울 청년 공고', url: 'https://apply.lh.or.kr/test', published_at: '2026-09-27' };
+const claim = async (id, token) => (await db.query('select public.claim_announcement($1,$2,$3,$4) as ok', ['LH',id,JSON.stringify(payload),token])).rows[0].ok;
+const begin = async (id, token) => (await db.query('select public.begin_delivery($1,$2,$3,$4,$5) as ok', ['LH',id,token,'{"total_units":100}','알림'])).rows[0].ok;
+const finish = async (id, token) => (await db.query('select public.complete_delivery($1,$2,$3,$4) as ok', ['LH',id,token,123])).rows[0].ok;
+assert.equal(await claim('one',token1),true);
+assert.equal(await claim('one',token2),false);
+assert.equal(await finish('one',token1),false);
+assert.equal(await begin('one',token2),false);
+assert.equal(await begin('one',token1),true);
+assert.equal(await claim('one',token2),false);
+assert.equal(await finish('one',token1),true);
+assert.equal(await finish('one',token1),true);
+assert.equal(await claim('one',token2),false);
+assert.equal((await db.query('select count(*)::int as n from public.announcements')).rows[0].n,1);
+assert.equal(await claim('expired',token1),true);
+await db.exec("update public.delivery_jobs set lease_until=now()-interval '1 hour' where post_id='expired'");
+assert.equal(await begin('expired',token1),false);
+assert.equal(await claim('expired',token2),true);
+assert.equal(await begin('expired',token1),false);
+assert.equal(await begin('expired',token2),true);
+await db.exec("update public.delivery_jobs set status='uncertain' where post_id='expired'");
+assert.equal(await claim('expired',token1),false);
+await db.exec('reset role');
+const policies = await db.query("select relname, relrowsecurity from pg_class where relname in ('announcements','delivery_jobs')");
+assert.ok(policies.rows.every(r => r.relrowsecurity));
+await db.exec('set role anon');
+await assert.rejects(db.query('select * from public.announcements'), /permission denied/);
+await assert.rejects(claim('forbidden',token1), /permission denied/);
+await db.close();
+console.log('SQL integration passed: claim exclusion, leases, send-before-insert, idempotent completion, uncertain hold, RLS/permissions.');
