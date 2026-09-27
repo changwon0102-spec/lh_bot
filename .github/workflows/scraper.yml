@@ -6,10 +6,26 @@ on:
     - cron: '0 0,9 * * *'
   workflow_dispatch:
     inputs:
+      source:
+        description: 'Site to crawl in this manual run'
+        type: choice
+        options:
+          - LH
+          - SH
+          - all
+        default: LH
       dry_run:
         description: 'Crawl/parse only; no DB writes, LLM calls, or Telegram messages'
         type: boolean
         default: true
+      max_posts:
+        description: 'Maximum announcements to process in this manual run'
+        type: choice
+        options:
+          - '1'
+          - '5'
+          - '20'
+        default: '1'
 
 permissions:
   contents: read
@@ -31,6 +47,8 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: gpt-4o
+      SOURCE: ${{ github.event_name == 'workflow_dispatch' && inputs.source || 'all' }}
+      MAX_POSTS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_posts || '20' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,4 +62,4 @@ jobs:
       - name: Crawl and notify
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
-        run: python main.py
+        run: python main.py --source "$SOURCE"

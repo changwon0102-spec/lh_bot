@@ -108,8 +108,8 @@ cp .env.example .env
 
 1. 코드를 GitHub 저장소의 **기본 브랜치**에 올립니다.
 2. **Settings → Secrets and variables → Actions → New repository secret**에서 위 표의 필수 Secret 5개를 등록합니다. `OPENAI_MODEL`은 Secret이 아니며 workflow에 기본값이 있습니다.
-3. **Actions → Youth housing alerts → Run workflow**에서 `dry_run=true`로 먼저 실행합니다.
-4. 로그 확인 후 `dry_run=false`로 수동 실행하면 실제 알림이 발송됩니다. 이후 스케줄 실행은 항상 실제 발송 모드입니다.
+3. **Actions → Youth housing alerts → Run workflow**에서 브랜치 `main`, `source=LH`, `dry_run=true`, `max_posts=1`로 먼저 실행합니다. 로그의 `preview`와 `오류=0`을 확인합니다.
+4. 이후 같은 설정에서 `dry_run=false`로 실행하면 LH 공고 최대 1건의 요약·알림을 시험할 수 있습니다. 실제 API 사용료가 발생합니다. `source=SH`는 접속·파서 확인용으로 별도 dry-run을 하세요. 정기 실행은 두 사이트를 대상으로 최대 20건을 실제 처리합니다.
 
 ```yaml
 schedule:
