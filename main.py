@@ -9,7 +9,9 @@ import argparse
 import io
 import json
 import logging
+import math
 import os
+import random
 import re
 import struct
 import sys
@@ -20,6 +22,7 @@ import zipfile
 import zlib
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
@@ -31,7 +34,7 @@ import requests
 from bs4 import BeautifulSoup
 from defusedxml import ElementTree
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from pydantic import BaseModel, ConfigDict, model_validator
 from supabase import create_client
 
@@ -76,6 +79,14 @@ class DeliveryUncertain(PipelineError):
     """The remote message may exist. Never retry this automatically."""
 
 
+class LLMQuotaError(PipelineError):
+    """Account/project quota needs user action; stop this run."""
+
+
+class LLMRateDeferred(PipelineError):
+    """A temporary limit outlasted bounded retries; try the next run."""
+
+
 @dataclass
 class Settings:
     lookback_days: int = 30
@@ -86,6 +97,7 @@ class Settings:
     max_pdf_pages: int = 150
     chunk_chars: int = 24000
     max_chunks: int = 12
+    llm_min_interval: float = 15.0
     model: str = "gpt-4o"
 
     @classmethod
@@ -99,10 +111,11 @@ class Settings:
             max_pdf_pages=int(os.getenv("MAX_PDF_PAGES", "150")),
             chunk_chars=int(os.getenv("LLM_CHUNK_CHARS", "24000")),
             max_chunks=int(os.getenv("MAX_LLM_CHUNKS", "12")),
+            llm_min_interval=float(os.getenv("LLM_MIN_INTERVAL_SECONDS", "15")),
             model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         )
         if min(s.lookback_days, s.max_list_pages, s.max_posts, s.max_attachment_mb,
-               s.max_pdf_pages, s.max_chunks) < 1 or s.chunk_chars < 2000 or s.request_delay < 0:
+               s.max_pdf_pages, s.max_chunks) < 1 or s.chunk_chars < 2000 or s.request_delay < 0 or s.llm_min_interval < 0:
             raise PipelineError("환경 변수의 숫자 범위를 확인하세요.")
         return s
 
@@ -640,18 +653,69 @@ def document_chunks(post: Announcement, doc: Document, size: int) -> list[str]:
     return chunks
 
 
+QUOTA_ERROR_CODES = {
+    "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded", "organization_usage_limit_exceeded", "billing_hard_limit_reached",
+}
+
+
+def rate_limit_code(exc: RateLimitError) -> str:
+    """Only expose a bounded machine code, never an API response body."""
+    code = exc.code or exc.type
+    return code if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code) else "unknown"
+
+
+def retry_after_seconds(exc: RateLimitError) -> float | None:
+    header = exc.response.headers.get("retry-after")
+    if not header:
+        return None
+    try:
+        seconds = float(header)
+    except ValueError:
+        try:
+            seconds = (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
 class Summarizer:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=90, max_retries=1)
+        # Use one explicit retry policy so the SDK cannot multiply 429 requests.
+        self.client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=90, max_retries=0)
+        self.last_request_at: float | None = None
 
     def request(self, text: str, instruction: str = "") -> HousingSummary:
-        result = self.client.chat.completions.parse(
-            model=self.settings.model, temperature=0,
-            messages=[{"role": "system", "content": SUMMARY_PROMPT + "\n" + instruction},
-                      {"role": "user", "content": text}],
-            response_format=HousingSummary, max_completion_tokens=5000,
-        )
+        waited = 0.0
+        for attempt in range(4):
+            if self.last_request_at is not None:
+                pause = self.settings.llm_min_interval - (time.monotonic() - self.last_request_at)
+                if pause > 0:
+                    time.sleep(pause)
+            self.last_request_at = time.monotonic()
+            try:
+                result = self.client.chat.completions.parse(
+                    model=self.settings.model, temperature=0,
+                    messages=[{"role": "system", "content": SUMMARY_PROMPT + "\n" + instruction},
+                              {"role": "user", "content": text}],
+                    response_format=HousingSummary, max_completion_tokens=5000,
+                )
+                break
+            except RateLimitError as exc:
+                code = rate_limit_code(exc)
+                if code in QUOTA_ERROR_CODES or exc.type == "insufficient_quota":
+                    raise LLMQuotaError(f"OpenAI API 잔액/사용 한도 확인 필요 (429, code={code})") from None
+                if attempt == 3:
+                    raise LLMRateDeferred(f"OpenAI 일시적 호출 제한으로 다음 실행에 재시도 (429, code={code})") from None
+                server_delay = retry_after_seconds(exc)
+                delay = max(1.0, server_delay if server_delay is not None else 60.0 * (2 ** attempt))
+                delay += random.uniform(0.0, 3.0)
+                if waited + delay > 600:
+                    raise LLMRateDeferred(f"OpenAI 재시도 대기 시간이 10분을 초과해 다음 실행으로 연기 (429, code={code})") from None
+                LOG.warning("OpenAI 429 (code=%s): %.0f초 대기 후 재시도 (%d/3)", code, delay, attempt + 1)
+                time.sleep(delay)
+                waited += delay
         choice = result.choices[0]
         if choice.finish_reason != "stop" or choice.message.refusal or choice.message.parsed is None:
             raise PipelineError("LLM 응답이 거절/잘림/파싱 실패 상태입니다.")
@@ -825,6 +889,10 @@ def process_post(post: Announcement, repo: Repository, crawler: Crawler,
             # A durable 'sending' row is already enough to block automatic resend.
             LOG.error("%s %s 상태 기록 실패; DB 수동 확인 필요", post.source, post.post_id)
         LOG.error("%s %s: %s (%s)", post.source, post.post_id, error, status)
+        if isinstance(exc, LLMQuotaError):
+            return "quota_exhausted"
+        if isinstance(exc, LLMRateDeferred):
+            return "rate_limited"
         return "failed"
 
 
@@ -901,8 +969,11 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
             stats[outcome] = stats.get(outcome, 0) + 1
             if outcome not in {"existing", "reserved"}:
                 processed += 1
-            if outcome == "failed":
+            if outcome in {"failed", "quota_exhausted", "rate_limited"}:
                 failures += 1
+            if outcome in {"quota_exhausted", "rate_limited"}:
+                LOG.error("OpenAI 제한으로 남은 공고 처리를 중단합니다. DB의 실패 건은 다음 실행에서 다시 시도합니다.")
+                break
         except Exception as exc:
             failures += 1
             processed += 1

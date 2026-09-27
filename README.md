@@ -162,8 +162,11 @@ GPT-4o Structured Outputs와 Pydantic 검증으로 JSON을 받습니다. 전체 
 | `MAX_PDF_PAGES` | 150 | PDF당 파싱 페이지 상한; 초과 시 누락 경고 |
 | `LLM_CHUNK_CHARS` | 24000 | LLM 입력 조각의 최대 문자 수; 토큰 수와 다름 |
 | `MAX_LLM_CHUNKS` | 12 | 공고당 입력 조각 상한 |
+| `LLM_MIN_INTERVAL_SECONDS` | 15 | 연속된 OpenAI 요약 요청 사이의 최소 간격(초) |
 
 첫 실행은 최근 30일에 게시된 일치 공고를 처리합니다. 이미 모집이 종료된 공고도 포함될 수 있습니다. 이미 DB에 기록된 실패 건은 게시일 범위를 벗어나도 재시도 후보가 됩니다. 수집 페이지·처리 상한에 도달하면 로그에 경고를 남깁니다. 긴 중단 후에는 `LOOKBACK_DAYS`, `MAX_LIST_PAGES`, `MAX_POSTS_PER_RUN`을 늘려 누락을 점검하세요.
+
+OpenAI가 HTTP 429를 반환하면 로그의 `code`를 확인하세요. `rate_limit_exceeded`처럼 일시적인 제한이면 서버의 `Retry-After`를 우선 따르고, 없으면 60·120·240초 간격으로 최대 3회 재시도합니다. 총 대기 10분을 넘으면 공고를 `failed`로 남기고 이번 실행의 후속 공고를 중단합니다. `insufficient_quota` 등 잔액·사용 한도 오류는 기다려도 해결되지 않으므로 즉시 중단합니다. 이때 OpenAI 플랫폼의 해당 프로젝트 사용량·결제 한도를 확인한 뒤 다시 실행하세요. 실패 공고는 다음 실행에서 처음부터 요약하므로 이전에 성공한 조각의 API 사용료가 다시 발생할 수 있습니다. `dry_run=true`는 OpenAI를 호출하지 않아 요약·알림 성공을 확인하지 못합니다.
 
 ## 중복 방지와 장애 복구
 

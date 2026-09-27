@@ -8,7 +8,9 @@ import zlib
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
 from bs4 import BeautifulSoup
+from openai import RateLimitError
 from pydantic import ValidationError
 
 import main as m
@@ -25,6 +27,18 @@ def summary(**changes):
 
 
 POST = m.Announcement("LH", "test-1", "서울 청년 매입임대 모집", "https://apply.lh.or.kr/test", "2026-09-27", "서울특별시")
+
+
+def openai_429(code, retry_after=None):
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    headers = {"retry-after": retry_after} if retry_after is not None else {}
+    response = httpx.Response(429, request=request, headers=headers)
+    return RateLimitError("private API response", response=response, body={"code": code, "type": code})
+
+
+def parsed_response():
+    return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop",
+        message=SimpleNamespace(refusal=None, parsed=summary()))])
 
 
 class ParsingTests(unittest.TestCase):
@@ -232,6 +246,90 @@ class ParsingTests(unittest.TestCase):
                 crawler.listings(m.TARGET_SITES[0])
 
 
+class SummarizerRetryTests(unittest.TestCase):
+    def setUp(self):
+        jitter = patch("main.random.uniform", return_value=0.0)
+        jitter.start()
+        self.addCleanup(jitter.stop)
+
+    def make_summarizer(self, responses, interval=0):
+        summarizer = object.__new__(m.Summarizer)
+        summarizer.settings = m.Settings(llm_min_interval=interval)
+        summarizer.client = Mock()
+        summarizer.client.chat.completions.parse.side_effect = responses
+        summarizer.last_request_at = None
+        return summarizer
+
+    @patch("main.time.sleep")
+    def test_retry_after_is_honored_and_result_is_parsed(self, sleep):
+        summarizer = self.make_summarizer([openai_429("rate_limit_exceeded", "75"), parsed_response()])
+        self.assertEqual(summarizer.request("본문").total_units, 100)
+        sleep.assert_called_once_with(75.0)
+        self.assertEqual(summarizer.client.chat.completions.parse.call_count, 2)
+
+    @patch("main.time.sleep")
+    def test_quota_exhaustion_does_not_retry_or_expose_response(self, sleep):
+        summarizer = self.make_summarizer([openai_429("insufficient_quota")])
+        with self.assertRaises(m.LLMQuotaError) as error:
+            summarizer.request("본문")
+        self.assertIn("insufficient_quota", str(error.exception))
+        self.assertNotIn("private API response", str(error.exception))
+        self.assertEqual(summarizer.client.chat.completions.parse.call_count, 1)
+        sleep.assert_not_called()
+
+    @patch("main.time.sleep")
+    def test_new_billing_code_is_classified_by_error_type(self, sleep):
+        error = openai_429("new_billing_code")
+        error.type = "insufficient_quota"
+        summarizer = self.make_summarizer([error])
+        with self.assertRaises(m.LLMQuotaError):
+            summarizer.request("본문")
+        sleep.assert_not_called()
+
+    @patch("main.time.sleep")
+    def test_temporary_limit_has_bounded_backoff(self, sleep):
+        summarizer = self.make_summarizer([openai_429("rate_limit_exceeded") for _ in range(4)])
+        with self.assertRaises(m.LLMRateDeferred):
+            summarizer.request("본문")
+        self.assertEqual(summarizer.client.chat.completions.parse.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [60.0, 120.0, 240.0])
+
+    @patch("main.time.sleep")
+    def test_long_server_retry_after_defers_without_sleep(self, sleep):
+        summarizer = self.make_summarizer([openai_429("rate_limit_exceeded", "601")])
+        with self.assertRaises(m.LLMRateDeferred):
+            summarizer.request("본문")
+        self.assertEqual(summarizer.client.chat.completions.parse.call_count, 1)
+        sleep.assert_not_called()
+
+    @patch("main.time.monotonic", side_effect=[100.0, 102.0, 115.0])
+    @patch("main.time.sleep")
+    def test_sequential_chunks_are_paced(self, sleep, monotonic):
+        summarizer = self.make_summarizer([parsed_response(), parsed_response()], interval=15)
+        summarizer.request("첫 조각")
+        summarizer.request("둘째 조각")
+        sleep.assert_called_once_with(13.0)
+
+
+class RunLimitTests(unittest.TestCase):
+    @patch("main.require_secrets")
+    @patch("main.Telegram")
+    @patch("main.Summarizer")
+    @patch("main.Repository")
+    @patch("main.Crawler")
+    @patch("main.PublicWeb")
+    @patch("main.process_post", return_value="quota_exhausted")
+    def test_quota_stops_before_next_paid_post(self, process, web, crawler, repo, summarizer, telegram, secrets):
+        repo.return_value.pending.return_value = []
+        crawler.return_value.listings.return_value = [POST,
+            m.Announcement("LH", "test-2", "서울 청년 매입임대 추가 모집",
+                "https://apply.lh.or.kr/another", "2026-09-28", "서울특별시")]
+        args = SimpleNamespace(dry_run=False, source="LH", output_dir=None)
+        with patch.dict(m.os.environ, {"TELEGRAM_BOT_TOKEN": "test", "TELEGRAM_CHAT_ID": "1"}):
+            self.assertEqual(m.run(args, m.Settings()), 1)
+        self.assertEqual(process.call_count, 1)
+
+
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
         self.repo = Mock()
@@ -271,6 +369,18 @@ class DeliveryTests(unittest.TestCase):
     def test_llm_failure_remains_retryable(self):
         self.summarizer.summarize.side_effect = ValueError("bad JSON")
         self.assertEqual(self.process(), "failed")
+        self.assertEqual(self.repo.mark.call_args.args[2], "failed")
+        self.telegram.send.assert_not_called()
+
+    def test_quota_error_stays_retryable_but_stops_run(self):
+        self.summarizer.summarize.side_effect = m.LLMQuotaError("insufficient_quota")
+        self.assertEqual(self.process(), "quota_exhausted")
+        self.assertEqual(self.repo.mark.call_args.args[2], "failed")
+        self.telegram.send.assert_not_called()
+
+    def test_rate_limit_error_stays_retryable_but_stops_run(self):
+        self.summarizer.summarize.side_effect = m.LLMRateDeferred("rate limit")
+        self.assertEqual(self.process(), "rate_limited")
         self.assertEqual(self.repo.mark.call_args.args[2], "failed")
         self.telegram.send.assert_not_called()
 
